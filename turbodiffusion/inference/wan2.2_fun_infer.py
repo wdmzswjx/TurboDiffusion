@@ -35,7 +35,8 @@ from rcm.datasets.utils import VIDEO_RES_SIZE_INFO
 from rcm.utils.umt5 import clear_umt5_memory, get_umt5_embedding
 from rcm.tokenizers.wan2pt1 import Wan2pt1VAEInterface
 
-from modify_model import tensor_kwargs, create_model
+from modify_model import tensor_kwargs, select_model, replace_attention
+from quantize_wan22_fun import replace_linear_norm_full
 
 torch._dynamo.config.suppress_errors = True
 
@@ -87,6 +88,42 @@ def parse_arguments() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def create_model_fun(dit_path: str, args) -> torch.nn.Module:
+    """
+    Load a Wan2.2-Fun-5B model from a quantized or non-quantized checkpoint.
+
+    For quantized checkpoints (saved by quantize_wan22_fun.py), the state_dict
+    already contains int8_weight/scale buffers. We create Int8Linear shells
+    (quantize=False) so load_state_dict can assign them correctly.
+
+    For non-quantized checkpoints, we create Int8Linear shells then load bf16
+    weights, which will populate the int8_weight buffer via assign=True.
+    """
+    from rcm.utils.model_utils import load_state_dict as _load_sd
+
+    with torch.device("meta"):
+        net = select_model(args.model)
+
+    state_dict = _load_sd(dit_path)
+
+    if args.attention_type in ["sla", "sagesla"]:
+        net = replace_attention(net, attention_type=args.attention_type, sla_topk=args.sla_topk)
+
+    # Create Int8Linear shells WITHOUT quantizing (quantize=False),
+    # so the model structure matches the state_dict keys (int8_weight, scale).
+    replace_linear_norm_full(
+        net,
+        replace_linear=args.quant_linear,
+        replace_norm=not args.default_norm,
+        quantize=False,
+    )
+
+    net.load_state_dict(state_dict, assign=True)
+    net = net.to(tensor_kwargs["device"]).eval()
+    del state_dict
+    return net
+
+
 def load_model_to_device(model, device, pin_memory=False):
     """Move model to target device with optional memory pinning."""
     if device == "cpu" and pin_memory:
@@ -135,11 +172,11 @@ if __name__ == "__main__":
 
     # Step 2: Load models with CPU offloading
     log.info("Loading DiT models (Wan2.2-Fun-5B)...")
-    high_noise_model = create_model(dit_path=args.high_noise_model_path, args=args)
+    high_noise_model = create_model_fun(dit_path=args.high_noise_model_path, args=args)
     high_noise_model = load_model_to_device(high_noise_model, "cpu", pin_memory=args.pin_memory)
     torch.cuda.empty_cache()
 
-    low_noise_model = create_model(dit_path=args.low_noise_model_path, args=args)
+    low_noise_model = create_model_fun(dit_path=args.low_noise_model_path, args=args)
     low_noise_model = load_model_to_device(low_noise_model, "cpu", pin_memory=args.pin_memory)
     torch.cuda.empty_cache()
     log.success("Successfully loaded DiT models.")

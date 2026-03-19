@@ -18,14 +18,19 @@ import argparse
 import os
 
 import torch
+import torch.nn as nn
 
 from modify_model import (
     select_model,
     replace_attention,
-    replace_linear_norm,
     tensor_kwargs,
 )
 from rcm.utils.model_utils import load_state_dict
+from rcm.networks.wan2pt2 import (
+    WanRMSNorm as WanRMSNorm2pt2,
+    WanLayerNorm as WanLayerNorm2pt2,
+)
+from ops import Int8Linear, FastRMSNorm, FastLayerNorm
 
 
 def load_checkpoint(input_path: str, input_format: str) -> dict:
@@ -44,7 +49,7 @@ def load_checkpoint(input_path: str, input_format: str) -> dict:
     return state_dict
 
 
-def remap_state_dict(state_dict: dict, net: torch.nn.Module, prefix: str = "") -> dict:
+def remap_state_dict(state_dict: dict, net: nn.Module, prefix: str = "") -> dict:
     """
     Remap state_dict keys by stripping known prefixes and reshaping
     patch_embedding weights if needed.
@@ -75,45 +80,122 @@ def remap_state_dict(state_dict: dict, net: torch.nn.Module, prefix: str = "") -
     return remapped
 
 
-def count_parameters(model: torch.nn.Module) -> dict:
-    """Count parameters by module type for reporting."""
-    total = 0
-    quantized = 0
-    from ops import Int8Linear
+def replace_linear_norm_full(
+    model: nn.Module,
+    replace_linear: bool = False,
+    replace_norm: bool = False,
+    quantize: bool = True,
+    skip_patterns: list = None,
+) -> nn.Module:
+    """
+    Replace Linear and Norm layers across the ENTIRE model (not just model.blocks).
+
+    Unlike the original replace_linear_norm which only operates on model.blocks,
+    this version traverses the full model graph. Certain sensitive layers
+    (e.g., patch_embedding, time_projection) can be skipped via skip_patterns.
+
+    Args:
+        model: The full WanModel instance.
+        replace_linear: Whether to replace nn.Linear with Int8Linear.
+        replace_norm: Whether to replace WanRMSNorm/WanLayerNorm with fast versions.
+        quantize: Whether to actually quantize weights (True) or just create
+                  Int8Linear shells for later loading (False).
+        skip_patterns: List of name substrings to skip (e.g., ["patch_embedding"]).
+    """
+    if skip_patterns is None:
+        # Skip layers where quantization may hurt quality or is unnecessary:
+        # - patch_embedding: small, input-facing, important for spatial fidelity
+        # - time_projection/time_embedding: small, conditioning pathway
+        # - head.head: output layer, quality-sensitive
+        # - proj_l: projection layers skipped in original implementation
+        skip_patterns = ["patch_embedding", "head.head", "proj_l"]
+
+    replacements = {}
+    quant_count = 0
+    skip_count = 0
+
     for name, module in model.named_modules():
-        for pname, param in module.named_parameters(recurse=False):
-            numel = param.numel()
-            total += numel
-            if isinstance(module, Int8Linear):
-                quantized += numel
-    for name, buf in model.named_buffers():
-        if "int8_weight" in name:
-            quantized += buf.numel()
-    return {"total": total, "quantized_layers_buffers": quantized}
+        should_skip = any(pat in name for pat in skip_patterns)
+
+        if isinstance(module, nn.Linear) and replace_linear:
+            if should_skip:
+                skip_count += 1
+                print(f"  [SKIP] {name}: {module.weight.shape} (matches skip pattern)")
+            else:
+                replacements[name] = Int8Linear.from_linear(module, quantize)
+                quant_count += 1
+
+        if isinstance(module, WanRMSNorm2pt2) and replace_norm:
+            if not should_skip:
+                replacements[name] = FastRMSNorm.from_rmsnorm(module)
+
+        if isinstance(module, WanLayerNorm2pt2) and replace_norm:
+            if not should_skip:
+                replacements[name] = FastLayerNorm.from_layernorm(module)
+
+    # Apply replacements via setattr on parent modules
+    for name, new_module in replacements.items():
+        name_parts = name.split(".")
+        parent = model
+        for part in name_parts[:-1]:
+            parent = getattr(parent, part)
+        setattr(parent, name_parts[-1], new_module)
+
+    if replace_linear:
+        print(f"  Quantized {quant_count} Linear layers, skipped {skip_count}")
+    return model
 
 
-def estimate_vram_savings(model: torch.nn.Module) -> dict:
-    """Estimate VRAM savings from INT8 quantization."""
-    bf16_size = 0
-    int8_size = 0
-    from ops import Int8Linear
+def diagnose_state_dict(model: nn.Module, label: str = "Model"):
+    """Print detailed diagnostics of state_dict contents for debugging."""
+    sd = model.state_dict()
+
+    total_bytes = 0
+    int8_bytes = 0
+    bf16_bytes = 0
+    fp32_bytes = 0
+    other_bytes = 0
+    int8_count = 0
+    linear_count = 0
+
+    dtype_sizes = {
+        torch.int8: 1, torch.float16: 2, torch.bfloat16: 2,
+        torch.float32: 4, torch.float64: 8, torch.int32: 4, torch.int64: 8,
+    }
+
+    for key, tensor in sd.items():
+        nbytes = tensor.numel() * dtype_sizes.get(tensor.dtype, tensor.element_size())
+        total_bytes += nbytes
+        if tensor.dtype == torch.int8:
+            int8_bytes += nbytes
+            int8_count += 1
+        elif tensor.dtype == torch.bfloat16:
+            bf16_bytes += nbytes
+        elif tensor.dtype == torch.float32:
+            fp32_bytes += nbytes
+        else:
+            other_bytes += nbytes
+
     for module in model.modules():
         if isinstance(module, Int8Linear):
-            # INT8 weight: out*in bytes, scale: row_blocks*col_blocks*4 bytes
-            w_bytes = module.int8_weight.numel() * 1  # int8 = 1 byte
-            s_bytes = module.scale.numel() * 4  # float32 = 4 bytes
-            int8_size += w_bytes + s_bytes
-            # Original would be out*in*2 bytes (bf16)
-            bf16_size += module.in_features * module.out_features * 2
-        elif isinstance(module, torch.nn.Linear):
-            bf16_size += module.weight.numel() * 2
+            linear_count += 1
 
-    return {
-        "original_bf16_mb": bf16_size / (1024 ** 2),
-        "quantized_mb": int8_size / (1024 ** 2),
-        "savings_mb": (bf16_size - int8_size) / (1024 ** 2),
-        "compression_ratio": bf16_size / max(int8_size, 1),
-    }
+    print(f"\n{'='*60}")
+    print(f"  Diagnostics: {label}")
+    print(f"{'='*60}")
+    print(f"  Total state_dict size:  {total_bytes / 1024**2:.1f} MB")
+    print(f"    - int8 tensors:       {int8_bytes / 1024**2:.1f} MB ({int8_count} tensors)")
+    print(f"    - bf16 tensors:       {bf16_bytes / 1024**2:.1f} MB")
+    print(f"    - fp32 tensors:       {fp32_bytes / 1024**2:.1f} MB")
+    print(f"    - other:              {other_bytes / 1024**2:.1f} MB")
+    print(f"  Int8Linear modules:     {linear_count}")
+    print(f"  nn.Linear modules:      {sum(1 for m in model.modules() if type(m) is nn.Linear)}")
+    if int8_count == 0 and linear_count == 0:
+        print(f"  *** WARNING: No INT8 quantization detected! ***")
+        print(f"  *** Did you forget --quant_linear? ***")
+    print(f"{'='*60}\n")
+
+    return total_bytes
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -153,8 +235,9 @@ def parse_arguments() -> argparse.Namespace:
         help="Keep default norms (skip fast Triton norm replacement)"
     )
     parser.add_argument(
-        "--skip_layer", type=str, default="proj_l",
-        help="Layer name pattern to skip during quantization"
+        "--skip_patterns", type=str, nargs="*",
+        default=["patch_embedding", "head.head", "proj_l"],
+        help="Layer name patterns to skip during quantization"
     )
     parser.add_argument(
         "--dry_run", action="store_true",
@@ -165,6 +248,11 @@ def parse_arguments() -> argparse.Namespace:
 
 if __name__ == "__main__":
     args = parse_arguments()
+
+    if not args.quant_linear:
+        print("WARNING: --quant_linear not set. No Linear layers will be quantized!")
+        print("         The output model will be the same size as the input.")
+        print("         Add --quant_linear to enable INT8 quantization.\n")
 
     print(f"[1/5] Creating Wan2.2-Fun-5B model on meta device...")
     with torch.device("meta"):
@@ -187,21 +275,26 @@ if __name__ == "__main__":
     net = net.to(tensor_kwargs["device"]).eval()
     del state_dict
 
-    # Apply quantization and fast norm replacement AFTER loading weights
-    net = replace_linear_norm(
+    # Diagnose BEFORE quantization
+    print("\n--- Before quantization ---")
+    original_bytes = diagnose_state_dict(net, "Original Model")
+
+    # Apply quantization using the full-model version
+    net = replace_linear_norm_full(
         net,
         replace_linear=args.quant_linear,
         replace_norm=not args.default_norm,
         quantize=True,
-        skip_layer=args.skip_layer,
+        skip_patterns=args.skip_patterns,
     )
 
-    # Report VRAM savings
-    savings = estimate_vram_savings(net)
-    print(f"  - Original BF16 weight size: {savings['original_bf16_mb']:.1f} MB")
-    print(f"  - Quantized weight size:     {savings['quantized_mb']:.1f} MB")
-    print(f"  - VRAM savings:              {savings['savings_mb']:.1f} MB")
-    print(f"  - Compression ratio:         {savings['compression_ratio']:.2f}x")
+    # Diagnose AFTER quantization
+    print("\n--- After quantization ---")
+    quantized_bytes = diagnose_state_dict(net, "Quantized Model")
+
+    if original_bytes > 0:
+        ratio = quantized_bytes / original_bytes
+        print(f"  Size ratio: {ratio:.2f}x ({(1-ratio)*100:.1f}% reduction)")
 
     if args.dry_run:
         print("Dry run complete. No model saved.")
@@ -210,5 +303,5 @@ if __name__ == "__main__":
         os.makedirs(os.path.dirname(args.output_path) or ".", exist_ok=True)
         torch.save(net.state_dict(), args.output_path)
         file_size_mb = os.path.getsize(args.output_path) / (1024 ** 2)
-        print(f"  - Saved file size: {file_size_mb:.1f} MB")
+        print(f"  Saved file size: {file_size_mb:.1f} MB")
         print("Done!")
