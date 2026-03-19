@@ -123,6 +123,19 @@ def select_model(model_name: str) -> torch.nn.Module:
             out_dim=16,
             text_len=512,
         )
+    elif model_name == "Wan2.2-Fun-5B":
+        return WanModel2pt2(
+            dim=3072,
+            eps=1e-06,
+            ffn_dim=8960,
+            freq_dim=256,
+            in_dim=36,
+            model_type="i2v",
+            num_heads=24,
+            num_layers=36,
+            out_dim=16,
+            text_len=512,
+        )
     else:
         raise ValueError(f"Unknown model name: {model_name}")
 
@@ -143,7 +156,7 @@ def create_model(dit_path: str, args: argparse.Namespace) -> torch.nn.Module:
 
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="TurboDiffusion replace attention module & quantize model")
-    parser.add_argument("--model", choices=["Wan2.1-1.3B", "Wan2.1-14B", "Wan2.2-A14B"], default="Wan2.1-1.3B", help="Model to use")
+    parser.add_argument("--model", choices=["Wan2.1-1.3B", "Wan2.1-14B", "Wan2.2-A14B", "Wan2.2-Fun-5B"], default="Wan2.1-1.3B", help="Model to use")
     parser.add_argument("--input_path", type=str, default="", help="Input path to the DiT model checkpoint for Wan model after rCM-SLA finetuning")
     parser.add_argument("--output_path", type=str, default="", help="Custom path to save the modified model checkpoint")
     parser.add_argument("--attention_type", choices=["sla", "sagesla", "original"], default="original", help="Type of attention mechanism to use")
