@@ -20,19 +20,20 @@ Provides multiple optimization strategies that can be combined:
 5. Channel-last memory     - Better GPU memory access patterns for convolutions
 6. Selective FP8/FP16      - Reduced precision for non-critical layers
 
-Usage:
-    from turbodiffusion.vae_optimize import optimize_vae, OptimizeConfig
+Supports both:
+- Native WanVAE (from this repo's rcm.tokenizers.wan2pt1)
+- Diffusers AutoencoderKLWan / AutoencoderKLWan2_2_ (auto-detected)
 
-    cfg = OptimizeConfig(
-        compile_mode="reduce-overhead",
-        spatial_tiling=True,
-        tile_size=256,
-        decode_temporal_batch=4,
-        channel_last=True,
-    )
+Usage (native):
+    from turbodiffusion.vae_optimize import optimize_vae, OptimizeConfig
     vae = WanVAE(...)
-    vae = optimize_vae(vae, cfg)
-    # Use vae.encode / vae.decode as before
+    vae = optimize_vae(vae, OptimizeConfig(compile_mode="max-autotune"))
+
+Usage (diffusers):
+    from diffusers import AutoencoderKLWan
+    from turbodiffusion.vae_optimize import optimize_vae, OptimizeConfig
+    vae = AutoencoderKLWan.from_pretrained(...)
+    vae = optimize_vae(vae, OptimizeConfig(compile_mode="max-autotune"))
 """
 
 import time
@@ -93,23 +94,28 @@ class OptimizeConfig:
 
 def optimize_vae(vae, config: Optional[OptimizeConfig] = None):
     """
-    Apply optimizations to a WanVAE instance and return an optimized wrapper.
+    Apply optimizations to a VAE instance and return an optimized wrapper.
 
-    Supports both WanVAE and Wan2pt1VAEInterface (used by Wan2.1/2.2 pipelines).
-    The underlying VAE architecture is shared between Wan2.1 and Wan2.2;
-    only the checkpoint weights differ.
+    Auto-detects the VAE type and applies the appropriate optimizations:
+    - Native WanVAE / Wan2pt1VAEInterface (this repo)
+    - Diffusers AutoencoderKLWan / AutoencoderKLWan2_2_ (from diffusers)
 
     Args:
-        vae: WanVAE or Wan2pt1VAEInterface instance
+        vae: WanVAE, Wan2pt1VAEInterface, or diffusers AutoencoderKLWan instance
         config: Optimization config. If None, uses sensible defaults.
 
     Returns:
-        OptimizedWanVAE wrapper with the same encode/decode interface.
+        Optimized wrapper with the same encode/decode interface as the input.
     """
     if config is None:
         config = OptimizeConfig()
 
-    # If passed a Wan2pt1VAEInterface, extract the inner WanVAE
+    # Diffusers AutoencoderKLWan path
+    if _is_diffusers_vae(vae):
+        logger.info(f"[VAE Optimize] Detected diffusers VAE: {type(vae).__name__}")
+        return OptimizedDiffusersWanVAE(vae, config)
+
+    # Native WanVAE path — if passed Wan2pt1VAEInterface, extract inner WanVAE
     inner = getattr(vae, "model", vae)
     return OptimizedWanVAE(inner, config)
 
@@ -445,6 +451,126 @@ class OptimizedWanVAE:
 
 
 # ---------------------------------------------------------------------------
+# Diffusers AutoencoderKLWan support
+# ---------------------------------------------------------------------------
+
+def _is_diffusers_vae(vae):
+    """Check if vae is a diffusers AutoencoderKLWan instance."""
+    cls_name = type(vae).__name__
+    # Match AutoencoderKLWan, AutoencoderKLWan2_2_, etc.
+    return "AutoencoderKL" in cls_name and "Wan" in cls_name
+
+
+class OptimizedDiffusersWanVAE(nn.Module):
+    """
+    Drop-in optimization wrapper for diffusers AutoencoderKLWan / AutoencoderKLWan2_2_.
+
+    Applies torch.compile and channel-last optimizations while preserving the
+    diffusers encode/decode interface (returns AutoencoderKLOutput / DecoderOutput).
+
+    Usage:
+        from diffusers import AutoencoderKLWan
+        vae = AutoencoderKLWan.from_pretrained(...)
+        vae = optimize_vae(vae)  # auto-detects diffusers VAE
+        # vae.encode / vae.decode work as before
+    """
+
+    def __init__(self, vae, config: OptimizeConfig):
+        super().__init__()
+        self.config = config
+        self.vae = vae
+
+        self._apply_optimizations()
+
+    def _apply_optimizations(self):
+        cfg = self.config
+        vae = self.vae
+
+        # 1. Channel-last memory format
+        if cfg.channel_last:
+            _apply_channel_last(vae)
+            logger.info("[VAE Optimize] Applied channels_last memory format (diffusers)")
+
+        # 2. torch.compile encoder/decoder submodules
+        if cfg.compile_encoder and hasattr(vae, "encoder"):
+            vae.encoder = torch.compile(
+                vae.encoder,
+                mode=cfg.compile_mode,
+                fullgraph=cfg.compile_fullgraph,
+                dynamic=cfg.compile_dynamic,
+            )
+            logger.info(f"[VAE Optimize] Compiled diffusers encoder (mode={cfg.compile_mode})")
+
+        if cfg.compile_decoder and hasattr(vae, "decoder"):
+            vae.decoder = torch.compile(
+                vae.decoder,
+                mode=cfg.compile_mode,
+                fullgraph=cfg.compile_fullgraph,
+                dynamic=cfg.compile_dynamic,
+            )
+            logger.info(f"[VAE Optimize] Compiled diffusers decoder (mode={cfg.compile_mode})")
+
+        # 3. Enable diffusers built-in tiling if requested
+        if cfg.spatial_tiling and hasattr(vae, "enable_tiling"):
+            vae.enable_tiling(
+                tile_sample_min_height=cfg.tile_size,
+                tile_sample_min_width=cfg.tile_size,
+                tile_sample_stride_height=cfg.tile_size - cfg.tile_overlap,
+                tile_sample_stride_width=cfg.tile_size - cfg.tile_overlap,
+            )
+            logger.info(
+                f"[VAE Optimize] Enabled diffusers built-in tiling "
+                f"(tile={cfg.tile_size}, overlap={cfg.tile_overlap})"
+            )
+
+    # ------------------------------------------------------------------
+    # Forward all attribute access to the wrapped VAE
+    # ------------------------------------------------------------------
+
+    def __getattr__(self, name):
+        # nn.Module.__getattr__ is called when normal attribute lookup fails.
+        # Delegate to the wrapped vae so that pipeline code can access
+        # .config, .dtype, .device, .latents_mean, .latents_std, etc.
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self.vae, name)
+
+    # ------------------------------------------------------------------
+    # Public interface (matches diffusers AutoencoderKLWan)
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def encode(self, *args, **kwargs):
+        """
+        Encode video tensor to latent distribution.
+        Returns AutoencoderKLOutput (same as diffusers).
+        """
+        t0 = time.perf_counter() if self.config.verbose else None
+        result = self.vae.encode(*args, **kwargs)
+        if t0 is not None:
+            torch.cuda.synchronize()
+            logger.info(f"[VAE Optimize] diffusers encode: {time.perf_counter() - t0:.3f}s")
+        return result
+
+    @torch.no_grad()
+    def decode(self, *args, **kwargs):
+        """
+        Decode latent tensor to video.
+        Returns DecoderOutput (same as diffusers).
+        """
+        t0 = time.perf_counter() if self.config.verbose else None
+        result = self.vae.decode(*args, **kwargs)
+        if t0 is not None:
+            torch.cuda.synchronize()
+            logger.info(f"[VAE Optimize] diffusers decode: {time.perf_counter() - t0:.3f}s")
+        return result
+
+    def forward(self, *args, **kwargs):
+        return self.vae(*args, **kwargs)
+
+
+# ---------------------------------------------------------------------------
 # Utility: channel-last memory format
 # ---------------------------------------------------------------------------
 
@@ -495,6 +621,15 @@ def _make_tile_blend_mask(tile_size, overlap, device, dtype):
 # Benchmark utility
 # ---------------------------------------------------------------------------
 
+def _extract_latent(enc_output):
+    """Extract latent tensor from encode output (handles both native and diffusers)."""
+    # Diffusers returns AutoencoderKLOutput with .latent_dist
+    if hasattr(enc_output, "latent_dist"):
+        return enc_output.latent_dist.sample()
+    # Native WanVAE returns tensor directly
+    return enc_output
+
+
 @torch.no_grad()
 def benchmark_vae(
     vae,
@@ -509,8 +644,11 @@ def benchmark_vae(
     """
     Benchmark VAE encode and decode with the given parameters.
 
+    Supports both native WanVAE and diffusers AutoencoderKLWan.
+
     Args:
-        vae: WanVAE or OptimizedWanVAE instance
+        vae: WanVAE, OptimizedWanVAE, diffusers AutoencoderKLWan, or
+             OptimizedDiffusersWanVAE instance
         frames: Number of video frames
         height, width: Spatial dimensions
         warmup: Number of warmup iterations
@@ -525,7 +663,7 @@ def benchmark_vae(
 
     # Warmup
     for _ in range(warmup):
-        z = vae.encode(video)
+        z = _extract_latent(vae.encode(video))
         _ = vae.decode(z)
         torch.cuda.synchronize()
 
@@ -534,12 +672,12 @@ def benchmark_vae(
     for _ in range(repeats):
         torch.cuda.synchronize()
         t0 = time.perf_counter()
-        z = vae.encode(video)
+        z = _extract_latent(vae.encode(video))
         torch.cuda.synchronize()
         encode_times.append((time.perf_counter() - t0) * 1000)
 
     # Benchmark decode
-    z = vae.encode(video)
+    z = _extract_latent(vae.encode(video))
     torch.cuda.synchronize()
     decode_times = []
     for _ in range(repeats):
@@ -602,6 +740,10 @@ Examples:
   # Compare baseline vs optimized
   python -m turbodiffusion.vae_optimize --vae_path checkpoints/Wan2.2_VAE.pth \\
       --compare --compile --decode_batch 4
+
+  # Diffusers AutoencoderKLWan (pass HF model dir or repo ID)
+  python -m turbodiffusion.vae_optimize --diffusers \\
+      --vae_path Wan-AI/Wan2.2-T2V-14B --compile --channel_last
         """,
     )
 
@@ -634,17 +776,30 @@ Examples:
     parser.add_argument("--repeats", type=int, default=5, help="Benchmark iterations")
     parser.add_argument("--compare", action="store_true",
                         help="Run baseline and optimized, then show comparison")
+    parser.add_argument("--diffusers", action="store_true",
+                        help="Load VAE using diffusers AutoencoderKLWan (--vae_path is a HF model dir)")
 
     args = parser.parse_args()
 
     # Import here to avoid import errors when running --help
     import sys
+    import os
     sys.path.insert(0, ".")
-    from rcm.tokenizers.wan2pt1 import WanVAE
 
-    print(f"Loading VAE from {args.vae_path} ...")
-    vae = WanVAE(z_dim=args.z_dim, vae_pth=args.vae_path, dtype=torch.bfloat16, is_amp=False)
-    print(f"VAE parameters: {vae.count_param() / 1e6:.1f}M")
+    if args.diffusers:
+        from diffusers import AutoencoderKLWan
+        print(f"Loading diffusers VAE from {args.vae_path} ...")
+        vae = AutoencoderKLWan.from_pretrained(
+            args.vae_path,
+            torch_dtype=torch.bfloat16,
+        ).to("cuda").eval()
+        param_count = sum(p.numel() for p in vae.parameters())
+        print(f"VAE parameters: {param_count / 1e6:.1f}M")
+    else:
+        from rcm.tokenizers.wan2pt1 import WanVAE
+        print(f"Loading VAE from {args.vae_path} ...")
+        vae = WanVAE(z_dim=args.z_dim, vae_pth=args.vae_path, dtype=torch.bfloat16, is_amp=False)
+        print(f"VAE parameters: {vae.count_param() / 1e6:.1f}M")
 
     if args.compare:
         # Baseline benchmark
