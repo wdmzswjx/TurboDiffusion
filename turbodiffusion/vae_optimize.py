@@ -485,6 +485,32 @@ class OptimizedDiffusersWanVAE(nn.Module):
         self.config = config
         self.vae = vae
 
+        # Detect whether the VAE supports our custom optimized loops.
+        # Requires: clear_cache, _feat_map, _conv_idx, decoder, post_quant_conv,
+        #           _enc_feat_map, _enc_conv_idx, encoder, quant_conv
+        self._supports_custom_loop = all(
+            hasattr(vae, attr) for attr in
+            ("clear_cache", "decoder", "encoder", "post_quant_conv", "quant_conv")
+        )
+        if self._supports_custom_loop:
+            # Verify cache attributes exist after clear_cache call
+            try:
+                vae.clear_cache()
+                self._supports_custom_loop = all(
+                    hasattr(vae, attr) for attr in
+                    ("_feat_map", "_conv_idx", "_enc_feat_map", "_enc_conv_idx")
+                )
+            except Exception:
+                self._supports_custom_loop = False
+
+        if self._supports_custom_loop:
+            logger.info("[VAE Optimize] Custom optimized encode/decode loops enabled")
+        else:
+            logger.info(
+                f"[VAE Optimize] {type(vae).__name__} lacks internal cache attributes, "
+                f"using passthrough mode (torch.compile + channel_last only)"
+            )
+
         self._apply_optimizations()
 
     def _apply_optimizations(self):
@@ -563,9 +589,19 @@ class OptimizedDiffusersWanVAE(nn.Module):
         - O(n) output assembly: collect chunks in list + single torch.cat
           (diffusers does repeated torch.cat → O(n²) memory copies)
         - torch.compile on the decoder submodule (applied in __init__)
+
+        Falls back to vae.decode() for VAEs without compatible internal structure.
         """
         t0 = time.perf_counter() if self.config.verbose else None
         vae = self.vae
+
+        # Fallback: VAE doesn't support our custom loop
+        if not self._supports_custom_loop:
+            result = vae.decode(z, return_dict=return_dict)
+            if t0 is not None:
+                torch.cuda.synchronize()
+                logger.info(f"[VAE Optimize] decode (passthrough): {time.perf_counter() - t0:.3f}s")
+            return result
 
         # If spatial tiling is enabled, delegate to diffusers built-in tiled_decode
         if getattr(vae, "use_tiling", False):
@@ -651,9 +687,19 @@ class OptimizedDiffusersWanVAE(nn.Module):
         Key optimizations vs diffusers _encode():
         - O(n) output assembly: collect chunks in list + single torch.cat
         - torch.compile on the encoder submodule (applied in __init__)
+
+        Falls back to vae.encode() for VAEs without compatible internal structure.
         """
         t0 = time.perf_counter() if self.config.verbose else None
         vae = self.vae
+
+        # Fallback: VAE doesn't support our custom loop
+        if not self._supports_custom_loop:
+            result = vae.encode(x, return_dict=return_dict)
+            if t0 is not None:
+                torch.cuda.synchronize()
+                logger.info(f"[VAE Optimize] encode (passthrough): {time.perf_counter() - t0:.3f}s")
+            return result
 
         # If spatial tiling is enabled, delegate to diffusers built-in tiled_encode
         if getattr(vae, "use_tiling", False):
