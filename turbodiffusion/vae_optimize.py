@@ -456,28 +456,42 @@ class OptimizedWanVAE:
 # ---------------------------------------------------------------------------
 
 def _is_diffusers_vae(vae):
-    """Check if vae is a diffusers AutoencoderKLWan instance."""
+    """Check if vae is a diffusers AutoencoderKLWan variant."""
     cls_name = type(vae).__name__
-    # Match AutoencoderKLWan, AutoencoderKLWan2_2_, etc.
     return "AutoencoderKL" in cls_name and "Wan" in cls_name
+
+
+def _patchify(x, patch_size):
+    """Rearrange spatial dims into channel dim."""
+    if patch_size <= 1:
+        return x
+    return rearrange(x, "b c f (h q) (w r) -> b (c r q) f h w",
+                     q=patch_size, r=patch_size)
+
+
+def _unpatchify(x, patch_size):
+    """Reverse of _patchify."""
+    if patch_size <= 1:
+        return x
+    return rearrange(x, "b (c r q) f h w -> b c f (h q) (w r)",
+                     q=patch_size, r=patch_size)
 
 
 class OptimizedDiffusersWanVAE(nn.Module):
     """
-    Drop-in optimization wrapper for diffusers AutoencoderKLWan / AutoencoderKLWan2_2_.
+    Drop-in optimization wrapper for diffusers Wan VAE variants.
 
-    Bypasses the default diffusers _decode()/_encode() loops and replaces them
-    with optimized versions that:
-    1. Use temporal batching (multiple latent frames per decoder call)
-    2. Collect results in a list + single torch.cat (O(n) vs O(n²) copies)
-    3. Apply torch.compile to the decoder/encoder submodules
-    4. Apply channels_last memory format
+    Supports two internal structures:
+    1. Standard AutoencoderKLWan: has clear_cache, decoder, encoder,
+       post_quant_conv, quant_conv directly on vae
+    2. AutoencoderKLWan3_8 (Wan2.2): has vae.model (AutoencoderKLWan2_2_)
+       with clear_cache, decoder, encoder, conv1, conv2; scale on vae
 
-    Usage:
-        from diffusers import AutoencoderKLWan
-        vae = AutoencoderKLWan.from_pretrained(...)
-        vae = optimize_vae(vae)  # auto-detects diffusers VAE
-        # vae.encode / vae.decode work as before
+    Optimizations:
+    - Temporal batching in decode (N frames/step instead of 1)
+    - O(n) output assembly (list + single cat, vs O(n²) repeated cat)
+    - torch.compile on encoder/decoder submodules
+    - channels_last memory format
     """
 
     def __init__(self, vae, config: OptimizeConfig):
@@ -485,79 +499,92 @@ class OptimizedDiffusersWanVAE(nn.Module):
         self.config = config
         self.vae = vae
 
-        # Detect whether the VAE supports our custom optimized loops.
-        # Requires: clear_cache, _feat_map, _conv_idx, decoder, post_quant_conv,
-        #           _enc_feat_map, _enc_conv_idx, encoder, quant_conv
-        self._supports_custom_loop = all(
-            hasattr(vae, attr) for attr in
-            ("clear_cache", "decoder", "encoder", "post_quant_conv", "quant_conv")
-        )
-        if self._supports_custom_loop:
-            # Verify cache attributes exist after clear_cache call
-            try:
-                vae.clear_cache()
-                self._supports_custom_loop = all(
-                    hasattr(vae, attr) for attr in
-                    ("_feat_map", "_conv_idx", "_enc_feat_map", "_enc_conv_idx")
-                )
-            except Exception:
-                self._supports_custom_loop = False
+        # --- Detect inner model structure ---
+        self._inner = None       # The model with clear_cache/decoder/encoder
+        self._scale = None       # Normalization [mean, 1/std]
+        self._patch_size = None  # patchify size (2 for Wan2.2, None for standard)
+        self._inner_type = None  # "wan2_2" or "standard"
 
-        if self._supports_custom_loop:
-            logger.info("[VAE Optimize] Custom optimized encode/decode loops enabled")
-        else:
+        # Pattern 1: AutoencoderKLWan3_8 — vae.model is AutoencoderKLWan2_2_
+        inner = getattr(vae, "model", None)
+        if (inner is not None
+                and hasattr(inner, "clear_cache")
+                and hasattr(inner, "decoder")
+                and hasattr(inner, "conv2")):
+            self._inner = inner
+            self._scale = getattr(vae, "scale", None)
+            self._inner_type = "wan2_2"
+            # Detect patch_size from encoder conv1 input channels
+            # 12 = 3 * 2 * 2 → patch_size=2
+            if hasattr(inner, "encoder") and hasattr(inner.encoder, "conv1"):
+                in_ch = inner.encoder.conv1.in_channels
+                self._patch_size = 2 if in_ch == 12 else None
             logger.info(
-                f"[VAE Optimize] {type(vae).__name__} lacks internal cache attributes, "
-                f"using passthrough mode (torch.compile + channel_last only)"
+                f"[VAE Optimize] Detected inner AutoencoderKLWan2_2_ "
+                f"(patch_size={self._patch_size})"
+            )
+
+        # Pattern 2: Standard AutoencoderKLWan — has post_quant_conv etc. on vae
+        elif hasattr(vae, "clear_cache") and hasattr(vae, "post_quant_conv"):
+            self._inner = vae
+            self._inner_type = "standard"
+            logger.info("[VAE Optimize] Detected standard AutoencoderKLWan")
+
+        # Pattern 3: vae itself has clear_cache but different structure
+        elif hasattr(vae, "clear_cache") and hasattr(vae, "decoder"):
+            self._inner = vae
+            self._inner_type = "standard"
+            logger.info("[VAE Optimize] Detected AutoencoderKLWan (generic)")
+
+        if self._inner is None:
+            logger.info(
+                f"[VAE Optimize] {type(vae).__name__}: passthrough mode "
+                f"(torch.compile + channel_last only)"
             )
 
         self._apply_optimizations()
 
     def _apply_optimizations(self):
         cfg = self.config
-        vae = self.vae
+        # Target the inner model for compile/channel_last (not the outer wrapper)
+        target = self._inner if self._inner is not None else self.vae
 
         # 1. Channel-last memory format
         if cfg.channel_last:
-            _apply_channel_last(vae)
-            logger.info("[VAE Optimize] Applied channels_last memory format (diffusers)")
+            _apply_channel_last(target)
+            logger.info("[VAE Optimize] Applied channels_last memory format")
 
         # 2. torch.compile encoder/decoder submodules
-        #    These are called per-frame/batch in our custom loops below,
-        #    so compiling them optimizes the hot inner loop.
-        if cfg.compile_encoder and hasattr(vae, "encoder"):
-            vae.encoder = torch.compile(
-                vae.encoder,
+        if cfg.compile_encoder and hasattr(target, "encoder"):
+            target.encoder = torch.compile(
+                target.encoder,
                 mode=cfg.compile_mode,
                 fullgraph=cfg.compile_fullgraph,
                 dynamic=cfg.compile_dynamic,
             )
-            logger.info(f"[VAE Optimize] Compiled diffusers encoder (mode={cfg.compile_mode})")
+            logger.info(f"[VAE Optimize] Compiled encoder (mode={cfg.compile_mode})")
 
-        if cfg.compile_decoder and hasattr(vae, "decoder"):
-            vae.decoder = torch.compile(
-                vae.decoder,
+        if cfg.compile_decoder and hasattr(target, "decoder"):
+            target.decoder = torch.compile(
+                target.decoder,
                 mode=cfg.compile_mode,
                 fullgraph=cfg.compile_fullgraph,
                 dynamic=cfg.compile_dynamic,
             )
-            logger.info(f"[VAE Optimize] Compiled diffusers decoder (mode={cfg.compile_mode})")
+            logger.info(f"[VAE Optimize] Compiled decoder (mode={cfg.compile_mode})")
 
-        # 3. Enable diffusers built-in tiling if requested
-        if cfg.spatial_tiling and hasattr(vae, "enable_tiling"):
+        # 3. Tiling
+        if cfg.spatial_tiling and hasattr(self.vae, "enable_tiling"):
             try:
-                vae.enable_tiling(
+                self.vae.enable_tiling(
                     tile_sample_min_height=cfg.tile_size,
                     tile_sample_min_width=cfg.tile_size,
                     tile_sample_stride_height=cfg.tile_size - cfg.tile_overlap,
                     tile_sample_stride_width=cfg.tile_size - cfg.tile_overlap,
                 )
-                logger.info(
-                    f"[VAE Optimize] Enabled diffusers built-in tiling "
-                    f"(tile={cfg.tile_size}, overlap={cfg.tile_overlap})"
-                )
+                logger.info(f"[VAE Optimize] Enabled tiling (tile={cfg.tile_size})")
             except (TypeError, AttributeError):
-                logger.warning("[VAE Optimize] This VAE does not support tiling, skipping")
+                pass
 
         if cfg.decode_temporal_batch > 1:
             logger.info(
@@ -566,7 +593,7 @@ class OptimizedDiffusersWanVAE(nn.Module):
             )
 
     # ------------------------------------------------------------------
-    # Forward all attribute access to the wrapped VAE
+    # Forward attribute access to the wrapped VAE
     # ------------------------------------------------------------------
 
     def __getattr__(self, name):
@@ -576,52 +603,103 @@ class OptimizedDiffusersWanVAE(nn.Module):
             return getattr(self.vae, name)
 
     # ------------------------------------------------------------------
-    # Optimized decode — bypasses diffusers _decode() loop
+    # Decode
     # ------------------------------------------------------------------
 
     @torch.no_grad()
     def decode(self, z, return_dict=True):
-        """
-        Optimized decode that replaces the diffusers frame-by-frame loop.
-
-        Key optimizations vs diffusers _decode():
-        - Temporal batching: process N latent frames per decoder call (default: 1→4)
-        - O(n) output assembly: collect chunks in list + single torch.cat
-          (diffusers does repeated torch.cat → O(n²) memory copies)
-        - torch.compile on the decoder submodule (applied in __init__)
-
-        Falls back to vae.decode() for VAEs without compatible internal structure.
-        """
         t0 = time.perf_counter() if self.config.verbose else None
-        vae = self.vae
 
-        # Fallback: VAE doesn't support our custom loop
-        if not self._supports_custom_loop:
-            result = vae.decode(z, return_dict=return_dict)
-            if t0 is not None:
-                torch.cuda.synchronize()
-                logger.info(f"[VAE Optimize] decode (passthrough): {time.perf_counter() - t0:.3f}s")
-            return result
+        if self._inner is None:
+            # Passthrough
+            result = self.vae.decode(z, return_dict=return_dict)
+        elif self._inner_type == "wan2_2":
+            result = self._decode_wan2_2(z, return_dict)
+        else:
+            result = self._decode_standard(z, return_dict)
 
-        # If spatial tiling is enabled, delegate to diffusers built-in tiled_decode
-        if getattr(vae, "use_tiling", False):
-            result = vae.decode(z, return_dict=return_dict)
-            if t0 is not None:
-                torch.cuda.synchronize()
-                logger.info(f"[VAE Optimize] decode (tiled): {time.perf_counter() - t0:.3f}s")
-            return result
+        if t0 is not None:
+            torch.cuda.synchronize()
+            logger.info(f"[VAE Optimize] decode: {time.perf_counter() - t0:.3f}s")
+        return result
 
-        # --- Custom optimized decode loop ---
+    def _decode_wan2_2(self, z, return_dict):
+        """
+        Optimized decode for AutoencoderKLWan2_2_ inner model.
+
+        Replaces the original per-sample + per-frame double loop with:
+        - Temporal batching (N frames/step)
+        - O(n) output assembly
+        """
+        inner = self._inner
+        scale = self._scale
+        batch_size = max(1, self.config.decode_temporal_batch)
+
+        decoded_samples = []
+        for b in range(z.shape[0]):
+            zb = z[b:b + 1]
+            inner.clear_cache()
+
+            # Undo scale normalization
+            s = [item.to(zb.device, zb.dtype) for item in scale]
+            zb_unscaled = zb / s[1].view(1, inner.z_dim, 1, 1, 1) + s[0].view(1, inner.z_dim, 1, 1, 1)
+
+            x = inner.conv2(zb_unscaled)
+            num_frames = x.shape[2]
+
+            # First frame (initializes caches, first_chunk=True)
+            inner._conv_idx = [0]
+            out_first = inner.decoder(
+                x[:, :, 0:1, :, :],
+                feat_cache=inner._feat_map,
+                feat_idx=inner._conv_idx,
+                first_chunk=True,
+            )
+
+            # Remaining frames in temporal batches
+            results = [out_first]
+            i = 1
+            while i < num_frames:
+                end = min(i + batch_size, num_frames)
+                inner._conv_idx = [0]
+                out_chunk = inner.decoder(
+                    x[:, :, i:end, :, :],
+                    feat_cache=inner._feat_map,
+                    feat_idx=inner._conv_idx,
+                )
+                results.append(out_chunk)
+                i = end
+
+            out = torch.cat(results, dim=2)
+
+            # Unpatchify
+            if self._patch_size:
+                out = _unpatchify(out, self._patch_size)
+
+            out = out.clamp(-1, 1)
+            inner.clear_cache()
+            decoded_samples.append(out.squeeze(0))
+
+        decoded = torch.stack(decoded_samples)
+
+        if not return_dict:
+            return (decoded,)
+        from diffusers.models.autoencoders.vae import DecoderOutput
+        return DecoderOutput(sample=decoded)
+
+    def _decode_standard(self, z, return_dict):
+        """
+        Optimized decode for standard AutoencoderKLWan.
+        """
+        vae = self._inner
         vae.clear_cache()
 
-        # 1. post_quant_conv on full tensor (same as diffusers)
         x = vae.post_quant_conv(z)
         num_frames = x.shape[2]
         batch_size = max(1, self.config.decode_temporal_batch)
 
-        # 2. First frame must be processed alone (initializes caches)
+        # First frame
         vae._conv_idx = [0]
-        # Some diffusers versions accept first_chunk, others don't
         try:
             out_first = vae.decoder(
                 x[:, :, 0:1, :, :],
@@ -636,8 +714,6 @@ class OptimizedDiffusersWanVAE(nn.Module):
                 feat_idx=vae._conv_idx,
             )
 
-        # 3. Process remaining frames in temporal batches
-        #    Collect in list for single torch.cat at the end (O(n) vs O(n²))
         results = [out_first]
         i = 1
         while i < num_frames:
@@ -651,81 +727,130 @@ class OptimizedDiffusersWanVAE(nn.Module):
             results.append(out_chunk)
             i = end
 
-        # 4. Single concatenation (vs N-1 growing concatenations in diffusers)
         out = torch.cat(results, dim=2)
 
-        # 5. Unpatchify if needed (matches diffusers behavior)
-        if hasattr(vae.config, "patch_size") and vae.config.patch_size is not None:
-            try:
-                from diffusers.models.autoencoders.autoencoder_kl_wan import unpatchify
-                out = unpatchify(out, patch_size=vae.config.patch_size)
-            except ImportError:
-                pass
+        # Unpatchify if needed
+        patch_size = getattr(getattr(vae, "config", None), "patch_size", None)
+        if patch_size:
+            out = _unpatchify(out, patch_size)
 
-        out = torch.clamp(out, min=-1.0, max=1.0)
+        out = torch.clamp(out, -1.0, 1.0)
         vae.clear_cache()
-
-        if t0 is not None:
-            torch.cuda.synchronize()
-            logger.info(f"[VAE Optimize] decode: {time.perf_counter() - t0:.3f}s")
 
         if not return_dict:
             return (out,)
-
-        from diffusers.models.modeling_outputs import DecoderOutput
+        from diffusers.models.autoencoders.vae import DecoderOutput
         return DecoderOutput(sample=out)
 
     # ------------------------------------------------------------------
-    # Optimized encode — bypasses diffusers _encode() loop
+    # Encode
     # ------------------------------------------------------------------
 
     @torch.no_grad()
     def encode(self, x, return_dict=True):
-        """
-        Optimized encode that replaces the diffusers frame-by-frame loop.
-
-        Key optimizations vs diffusers _encode():
-        - O(n) output assembly: collect chunks in list + single torch.cat
-        - torch.compile on the encoder submodule (applied in __init__)
-
-        Falls back to vae.encode() for VAEs without compatible internal structure.
-        """
         t0 = time.perf_counter() if self.config.verbose else None
-        vae = self.vae
 
-        # Fallback: VAE doesn't support our custom loop
-        if not self._supports_custom_loop:
-            result = vae.encode(x, return_dict=return_dict)
-            if t0 is not None:
-                torch.cuda.synchronize()
-                logger.info(f"[VAE Optimize] encode (passthrough): {time.perf_counter() - t0:.3f}s")
-            return result
+        if self._inner is None:
+            result = self.vae.encode(x, return_dict=return_dict)
+        elif self._inner_type == "wan2_2":
+            result = self._encode_wan2_2(x, return_dict)
+        else:
+            result = self._encode_standard(x, return_dict)
 
-        # If spatial tiling is enabled, delegate to diffusers built-in tiled_encode
-        if getattr(vae, "use_tiling", False):
-            result = vae.encode(x, return_dict=return_dict)
-            if t0 is not None:
-                torch.cuda.synchronize()
-                logger.info(f"[VAE Optimize] encode (tiled): {time.perf_counter() - t0:.3f}s")
-            return result
+        if t0 is not None:
+            torch.cuda.synchronize()
+            logger.info(f"[VAE Optimize] encode: {time.perf_counter() - t0:.3f}s")
+        return result
 
-        # --- Custom optimized encode loop ---
+    def _encode_wan2_2(self, x, return_dict):
+        """
+        Optimized encode for AutoencoderKLWan2_2_ inner model.
+        """
+        inner = self._inner
+        scale = self._scale
+        temporal_window = 4
+
+        encoded_samples = []
+        for b in range(x.shape[0]):
+            xb = x[b:b + 1]
+            inner.clear_cache()
+
+            s = [item.to(xb.device, xb.dtype) for item in scale]
+
+            # Patchify
+            if self._patch_size:
+                xb = _patchify(xb, self._patch_size)
+
+            t = xb.shape[2]
+            iter_ = 1 + (t - 1) // temporal_window
+
+            # First frame
+            inner._enc_conv_idx = [0]
+            out_first = inner.encoder(
+                xb[:, :, :1, :, :],
+                feat_cache=inner._enc_feat_map,
+                feat_idx=inner._enc_conv_idx,
+            )
+
+            results = [out_first]
+            for i in range(1, iter_):
+                start = 1 + temporal_window * (i - 1)
+                end = 1 + temporal_window * i
+                inner._enc_conv_idx = [0]
+                out_chunk = inner.encoder(
+                    xb[:, :, start:end, :, :],
+                    feat_cache=inner._enc_feat_map,
+                    feat_idx=inner._enc_conv_idx,
+                )
+                results.append(out_chunk)
+
+            # Handle remainder
+            remainder_start = 1 + temporal_window * (iter_ - 1)
+            if (t - 1) % temporal_window and remainder_start < t:
+                inner._enc_conv_idx = [0]
+                out_rem = inner.encoder(
+                    xb[:, :, remainder_start:, :, :],
+                    feat_cache=inner._enc_feat_map,
+                    feat_idx=inner._enc_conv_idx,
+                )
+                results.append(out_rem)
+
+            out = torch.cat(results, dim=2)
+
+            # quant_conv + scale normalization
+            mu, log_var = inner.conv1(out).chunk(2, dim=1)
+            mu = (mu - s[0].view(1, inner.z_dim, 1, 1, 1)) * s[1].view(1, inner.z_dim, 1, 1, 1)
+            enc = torch.cat([mu, log_var], dim=1)
+
+            inner.clear_cache()
+            encoded_samples.append(enc.squeeze(0))
+
+        h = torch.stack(encoded_samples)
+
+        from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
+        posterior = DiagonalGaussianDistribution(h)
+        if not return_dict:
+            return (posterior,)
+        from diffusers.models.modeling_outputs import AutoencoderKLOutput
+        return AutoencoderKLOutput(latent_dist=posterior)
+
+    def _encode_standard(self, x, return_dict):
+        """
+        Optimized encode for standard AutoencoderKLWan.
+        """
+        vae = self._inner
         vae.clear_cache()
 
         # Patchify if needed
-        if hasattr(vae.config, "patch_size") and vae.config.patch_size is not None:
-            try:
-                from diffusers.models.autoencoders.autoencoder_kl_wan import patchify
-                x = patchify(x, patch_size=vae.config.patch_size)
-            except ImportError:
-                pass
+        patch_size = getattr(getattr(vae, "config", None), "patch_size", None)
+        if patch_size:
+            x = _patchify(x, patch_size)
 
         num_frames = x.shape[2]
-        # Encode processes in 4-frame temporal windows (matching diffusers behavior)
         temporal_window = 4
         iter_ = 1 + (num_frames - 1) // temporal_window
 
-        # First frame alone
+        # First frame
         vae._enc_conv_idx = [0]
         out_first = vae.encoder(
             x[:, :, :1, :, :],
@@ -733,7 +858,6 @@ class OptimizedDiffusersWanVAE(nn.Module):
             feat_idx=vae._enc_conv_idx,
         )
 
-        # Remaining frames in temporal windows — collect in list
         results = [out_first]
         for i in range(1, iter_):
             start = 1 + temporal_window * (i - 1)
@@ -746,7 +870,6 @@ class OptimizedDiffusersWanVAE(nn.Module):
             )
             results.append(out_chunk)
 
-        # Handle remainder if frames don't divide evenly
         remainder_start = 1 + temporal_window * (iter_ - 1)
         if (num_frames - 1) % temporal_window and remainder_start < num_frames:
             vae._enc_conv_idx = [0]
@@ -757,24 +880,16 @@ class OptimizedDiffusersWanVAE(nn.Module):
             )
             results.append(out_rem)
 
-        # Single cat
         out = torch.cat(results, dim=2)
-
-        # quant_conv (same as diffusers)
         enc = vae.quant_conv(out)
         vae.clear_cache()
 
-        if t0 is not None:
-            torch.cuda.synchronize()
-            logger.info(f"[VAE Optimize] encode: {time.perf_counter() - t0:.3f}s")
-
-        if not return_dict:
-            from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
-            return (DiagonalGaussianDistribution(enc),)
-
         from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
+        posterior = DiagonalGaussianDistribution(enc)
+        if not return_dict:
+            return (posterior,)
         from diffusers.models.modeling_outputs import AutoencoderKLOutput
-        return AutoencoderKLOutput(latent_dist=DiagonalGaussianDistribution(enc))
+        return AutoencoderKLOutput(latent_dist=posterior)
 
     def forward(self, *args, **kwargs):
         return self.vae(*args, **kwargs)
