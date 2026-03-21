@@ -519,16 +519,19 @@ class OptimizedDiffusersWanVAE(nn.Module):
 
         # 3. Enable diffusers built-in tiling if requested
         if cfg.spatial_tiling and hasattr(vae, "enable_tiling"):
-            vae.enable_tiling(
-                tile_sample_min_height=cfg.tile_size,
-                tile_sample_min_width=cfg.tile_size,
-                tile_sample_stride_height=cfg.tile_size - cfg.tile_overlap,
-                tile_sample_stride_width=cfg.tile_size - cfg.tile_overlap,
-            )
-            logger.info(
-                f"[VAE Optimize] Enabled diffusers built-in tiling "
-                f"(tile={cfg.tile_size}, overlap={cfg.tile_overlap})"
-            )
+            try:
+                vae.enable_tiling(
+                    tile_sample_min_height=cfg.tile_size,
+                    tile_sample_min_width=cfg.tile_size,
+                    tile_sample_stride_height=cfg.tile_size - cfg.tile_overlap,
+                    tile_sample_stride_width=cfg.tile_size - cfg.tile_overlap,
+                )
+                logger.info(
+                    f"[VAE Optimize] Enabled diffusers built-in tiling "
+                    f"(tile={cfg.tile_size}, overlap={cfg.tile_overlap})"
+                )
+            except (TypeError, AttributeError):
+                logger.warning("[VAE Optimize] This VAE does not support tiling, skipping")
 
         if cfg.decode_temporal_batch > 1:
             logger.info(
@@ -565,7 +568,7 @@ class OptimizedDiffusersWanVAE(nn.Module):
         vae = self.vae
 
         # If spatial tiling is enabled, delegate to diffusers built-in tiled_decode
-        if vae.use_tiling:
+        if getattr(vae, "use_tiling", False):
             result = vae.decode(z, return_dict=return_dict)
             if t0 is not None:
                 torch.cuda.synchronize()
@@ -580,14 +583,22 @@ class OptimizedDiffusersWanVAE(nn.Module):
         num_frames = x.shape[2]
         batch_size = max(1, self.config.decode_temporal_batch)
 
-        # 2. First frame must be processed alone (initializes caches, first_chunk=True)
+        # 2. First frame must be processed alone (initializes caches)
         vae._conv_idx = [0]
-        out_first = vae.decoder(
-            x[:, :, 0:1, :, :],
-            feat_cache=vae._feat_map,
-            feat_idx=vae._conv_idx,
-            first_chunk=True,
-        )
+        # Some diffusers versions accept first_chunk, others don't
+        try:
+            out_first = vae.decoder(
+                x[:, :, 0:1, :, :],
+                feat_cache=vae._feat_map,
+                feat_idx=vae._conv_idx,
+                first_chunk=True,
+            )
+        except TypeError:
+            out_first = vae.decoder(
+                x[:, :, 0:1, :, :],
+                feat_cache=vae._feat_map,
+                feat_idx=vae._conv_idx,
+            )
 
         # 3. Process remaining frames in temporal batches
         #    Collect in list for single torch.cat at the end (O(n) vs O(n²))
@@ -645,7 +656,7 @@ class OptimizedDiffusersWanVAE(nn.Module):
         vae = self.vae
 
         # If spatial tiling is enabled, delegate to diffusers built-in tiled_encode
-        if vae.use_tiling:
+        if getattr(vae, "use_tiling", False):
             result = vae.encode(x, return_dict=return_dict)
             if t0 is not None:
                 torch.cuda.synchronize()
