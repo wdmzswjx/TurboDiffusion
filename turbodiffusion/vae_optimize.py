@@ -95,8 +95,12 @@ def optimize_vae(vae, config: Optional[OptimizeConfig] = None):
     """
     Apply optimizations to a WanVAE instance and return an optimized wrapper.
 
+    Supports both WanVAE and Wan2pt1VAEInterface (used by Wan2.1/2.2 pipelines).
+    The underlying VAE architecture is shared between Wan2.1 and Wan2.2;
+    only the checkpoint weights differ.
+
     Args:
-        vae: WanVAE instance (from rcm.tokenizers.wan2pt1)
+        vae: WanVAE or Wan2pt1VAEInterface instance
         config: Optimization config. If None, uses sensible defaults.
 
     Returns:
@@ -105,7 +109,34 @@ def optimize_vae(vae, config: Optional[OptimizeConfig] = None):
     if config is None:
         config = OptimizeConfig()
 
-    return OptimizedWanVAE(vae, config)
+    # If passed a Wan2pt1VAEInterface, extract the inner WanVAE
+    inner = getattr(vae, "model", vae)
+    return OptimizedWanVAE(inner, config)
+
+
+def optimize_tokenizer(tokenizer, config: Optional[OptimizeConfig] = None):
+    """
+    Optimize a Wan2pt1VAEInterface tokenizer in-place by replacing its
+    internal WanVAE with an optimized version.
+
+    This is the easiest way to accelerate VAE in the Wan2.2 inference pipeline:
+
+        tokenizer = Wan2pt1VAEInterface(vae_pth="checkpoints/Wan2.2_VAE.pth")
+        optimize_tokenizer(tokenizer)
+        # tokenizer.encode / tokenizer.decode are now accelerated
+
+    Args:
+        tokenizer: Wan2pt1VAEInterface instance
+        config: Optimization config. If None, uses sensible defaults.
+
+    Returns:
+        The same tokenizer instance (modified in-place).
+    """
+    if config is None:
+        config = OptimizeConfig()
+
+    tokenizer.model = OptimizedWanVAE(tokenizer.model, config)
+    return tokenizer
 
 
 class OptimizedWanVAE:
@@ -553,29 +584,29 @@ def main():
         epilog="""
 Examples:
   # Benchmark with torch.compile (max-autotune)
-  python -m turbodiffusion.vae_optimize --vae_path assets/checkpoints/Wan2.1_VAE.pth \\
+  python -m turbodiffusion.vae_optimize --vae_path checkpoints/Wan2.2_VAE.pth \\
       --compile --compile_mode max-autotune
 
   # Benchmark with spatial tiling (for high-res / low VRAM)
-  python -m turbodiffusion.vae_optimize --vae_path assets/checkpoints/Wan2.1_VAE.pth \\
+  python -m turbodiffusion.vae_optimize --vae_path checkpoints/Wan2.2_VAE.pth \\
       --tiling --tile_size 256
 
   # Benchmark with decode temporal batching
-  python -m turbodiffusion.vae_optimize --vae_path assets/checkpoints/Wan2.1_VAE.pth \\
+  python -m turbodiffusion.vae_optimize --vae_path checkpoints/Wan2.2_VAE.pth \\
       --compile --decode_batch 4
 
   # Full optimization
-  python -m turbodiffusion.vae_optimize --vae_path assets/checkpoints/Wan2.1_VAE.pth \\
+  python -m turbodiffusion.vae_optimize --vae_path checkpoints/Wan2.2_VAE.pth \\
       --compile --channel_last --decode_batch 4
 
   # Compare baseline vs optimized
-  python -m turbodiffusion.vae_optimize --vae_path assets/checkpoints/Wan2.1_VAE.pth \\
+  python -m turbodiffusion.vae_optimize --vae_path checkpoints/Wan2.2_VAE.pth \\
       --compare --compile --decode_batch 4
         """,
     )
 
     parser.add_argument("--vae_path", type=str, required=True,
-                        help="Path to VAE checkpoint (e.g. Wan2.1_VAE.pth)")
+                        help="Path to VAE checkpoint (e.g. Wan2.2_VAE.pth)")
     parser.add_argument("--z_dim", type=int, default=16, help="Latent dimension")
 
     # Optimization flags
