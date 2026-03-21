@@ -72,8 +72,9 @@ class OptimizeConfig:
     tile_overlap: int = 32
 
     # Decode temporal batching: process N latent frames per decoder forward
-    # instead of the default 1-frame-at-a-time loop
-    decode_temporal_batch: int = 1
+    # instead of the default 1-frame-at-a-time loop.
+    # 4 is a good default — reduces 20 decoder calls to 5.
+    decode_temporal_batch: int = 4
 
     # Channel-last memory format for Conv2d/Conv3d
     channel_last: bool = True
@@ -465,8 +466,12 @@ class OptimizedDiffusersWanVAE(nn.Module):
     """
     Drop-in optimization wrapper for diffusers AutoencoderKLWan / AutoencoderKLWan2_2_.
 
-    Applies torch.compile and channel-last optimizations while preserving the
-    diffusers encode/decode interface (returns AutoencoderKLOutput / DecoderOutput).
+    Bypasses the default diffusers _decode()/_encode() loops and replaces them
+    with optimized versions that:
+    1. Use temporal batching (multiple latent frames per decoder call)
+    2. Collect results in a list + single torch.cat (O(n) vs O(n²) copies)
+    3. Apply torch.compile to the decoder/encoder submodules
+    4. Apply channels_last memory format
 
     Usage:
         from diffusers import AutoencoderKLWan
@@ -492,6 +497,8 @@ class OptimizedDiffusersWanVAE(nn.Module):
             logger.info("[VAE Optimize] Applied channels_last memory format (diffusers)")
 
         # 2. torch.compile encoder/decoder submodules
+        #    These are called per-frame/batch in our custom loops below,
+        #    so compiling them optimizes the hot inner loop.
         if cfg.compile_encoder and hasattr(vae, "encoder"):
             vae.encoder = torch.compile(
                 vae.encoder,
@@ -523,48 +530,194 @@ class OptimizedDiffusersWanVAE(nn.Module):
                 f"(tile={cfg.tile_size}, overlap={cfg.tile_overlap})"
             )
 
+        if cfg.decode_temporal_batch > 1:
+            logger.info(
+                f"[VAE Optimize] Decode temporal batching: "
+                f"{cfg.decode_temporal_batch} latent frames/step"
+            )
+
     # ------------------------------------------------------------------
     # Forward all attribute access to the wrapped VAE
     # ------------------------------------------------------------------
 
     def __getattr__(self, name):
-        # nn.Module.__getattr__ is called when normal attribute lookup fails.
-        # Delegate to the wrapped vae so that pipeline code can access
-        # .config, .dtype, .device, .latents_mean, .latents_std, etc.
         try:
             return super().__getattr__(name)
         except AttributeError:
             return getattr(self.vae, name)
 
     # ------------------------------------------------------------------
-    # Public interface (matches diffusers AutoencoderKLWan)
+    # Optimized decode — bypasses diffusers _decode() loop
     # ------------------------------------------------------------------
 
     @torch.no_grad()
-    def encode(self, *args, **kwargs):
+    def decode(self, z, return_dict=True):
         """
-        Encode video tensor to latent distribution.
-        Returns AutoencoderKLOutput (same as diffusers).
+        Optimized decode that replaces the diffusers frame-by-frame loop.
+
+        Key optimizations vs diffusers _decode():
+        - Temporal batching: process N latent frames per decoder call (default: 1→4)
+        - O(n) output assembly: collect chunks in list + single torch.cat
+          (diffusers does repeated torch.cat → O(n²) memory copies)
+        - torch.compile on the decoder submodule (applied in __init__)
         """
         t0 = time.perf_counter() if self.config.verbose else None
-        result = self.vae.encode(*args, **kwargs)
+        vae = self.vae
+
+        # If spatial tiling is enabled, delegate to diffusers built-in tiled_decode
+        if vae.use_tiling:
+            result = vae.decode(z, return_dict=return_dict)
+            if t0 is not None:
+                torch.cuda.synchronize()
+                logger.info(f"[VAE Optimize] decode (tiled): {time.perf_counter() - t0:.3f}s")
+            return result
+
+        # --- Custom optimized decode loop ---
+        vae.clear_cache()
+
+        # 1. post_quant_conv on full tensor (same as diffusers)
+        x = vae.post_quant_conv(z)
+        num_frames = x.shape[2]
+        batch_size = max(1, self.config.decode_temporal_batch)
+
+        # 2. First frame must be processed alone (initializes caches, first_chunk=True)
+        vae._conv_idx = [0]
+        out_first = vae.decoder(
+            x[:, :, 0:1, :, :],
+            feat_cache=vae._feat_map,
+            feat_idx=vae._conv_idx,
+            first_chunk=True,
+        )
+
+        # 3. Process remaining frames in temporal batches
+        #    Collect in list for single torch.cat at the end (O(n) vs O(n²))
+        results = [out_first]
+        i = 1
+        while i < num_frames:
+            end = min(i + batch_size, num_frames)
+            vae._conv_idx = [0]
+            out_chunk = vae.decoder(
+                x[:, :, i:end, :, :],
+                feat_cache=vae._feat_map,
+                feat_idx=vae._conv_idx,
+            )
+            results.append(out_chunk)
+            i = end
+
+        # 4. Single concatenation (vs N-1 growing concatenations in diffusers)
+        out = torch.cat(results, dim=2)
+
+        # 5. Unpatchify if needed (matches diffusers behavior)
+        if hasattr(vae.config, "patch_size") and vae.config.patch_size is not None:
+            try:
+                from diffusers.models.autoencoders.autoencoder_kl_wan import unpatchify
+                out = unpatchify(out, patch_size=vae.config.patch_size)
+            except ImportError:
+                pass
+
+        out = torch.clamp(out, min=-1.0, max=1.0)
+        vae.clear_cache()
+
         if t0 is not None:
             torch.cuda.synchronize()
-            logger.info(f"[VAE Optimize] diffusers encode: {time.perf_counter() - t0:.3f}s")
-        return result
+            logger.info(f"[VAE Optimize] decode: {time.perf_counter() - t0:.3f}s")
+
+        if not return_dict:
+            return (out,)
+
+        from diffusers.models.modeling_outputs import DecoderOutput
+        return DecoderOutput(sample=out)
+
+    # ------------------------------------------------------------------
+    # Optimized encode — bypasses diffusers _encode() loop
+    # ------------------------------------------------------------------
 
     @torch.no_grad()
-    def decode(self, *args, **kwargs):
+    def encode(self, x, return_dict=True):
         """
-        Decode latent tensor to video.
-        Returns DecoderOutput (same as diffusers).
+        Optimized encode that replaces the diffusers frame-by-frame loop.
+
+        Key optimizations vs diffusers _encode():
+        - O(n) output assembly: collect chunks in list + single torch.cat
+        - torch.compile on the encoder submodule (applied in __init__)
         """
         t0 = time.perf_counter() if self.config.verbose else None
-        result = self.vae.decode(*args, **kwargs)
+        vae = self.vae
+
+        # If spatial tiling is enabled, delegate to diffusers built-in tiled_encode
+        if vae.use_tiling:
+            result = vae.encode(x, return_dict=return_dict)
+            if t0 is not None:
+                torch.cuda.synchronize()
+                logger.info(f"[VAE Optimize] encode (tiled): {time.perf_counter() - t0:.3f}s")
+            return result
+
+        # --- Custom optimized encode loop ---
+        vae.clear_cache()
+
+        # Patchify if needed
+        if hasattr(vae.config, "patch_size") and vae.config.patch_size is not None:
+            try:
+                from diffusers.models.autoencoders.autoencoder_kl_wan import patchify
+                x = patchify(x, patch_size=vae.config.patch_size)
+            except ImportError:
+                pass
+
+        num_frames = x.shape[2]
+        # Encode processes in 4-frame temporal windows (matching diffusers behavior)
+        temporal_window = 4
+        iter_ = 1 + (num_frames - 1) // temporal_window
+
+        # First frame alone
+        vae._enc_conv_idx = [0]
+        out_first = vae.encoder(
+            x[:, :, :1, :, :],
+            feat_cache=vae._enc_feat_map,
+            feat_idx=vae._enc_conv_idx,
+        )
+
+        # Remaining frames in temporal windows — collect in list
+        results = [out_first]
+        for i in range(1, iter_):
+            start = 1 + temporal_window * (i - 1)
+            end = 1 + temporal_window * i
+            vae._enc_conv_idx = [0]
+            out_chunk = vae.encoder(
+                x[:, :, start:end, :, :],
+                feat_cache=vae._enc_feat_map,
+                feat_idx=vae._enc_conv_idx,
+            )
+            results.append(out_chunk)
+
+        # Handle remainder if frames don't divide evenly
+        remainder_start = 1 + temporal_window * (iter_ - 1)
+        if (num_frames - 1) % temporal_window and remainder_start < num_frames:
+            vae._enc_conv_idx = [0]
+            out_rem = vae.encoder(
+                x[:, :, remainder_start:, :, :],
+                feat_cache=vae._enc_feat_map,
+                feat_idx=vae._enc_conv_idx,
+            )
+            results.append(out_rem)
+
+        # Single cat
+        out = torch.cat(results, dim=2)
+
+        # quant_conv (same as diffusers)
+        enc = vae.quant_conv(out)
+        vae.clear_cache()
+
         if t0 is not None:
             torch.cuda.synchronize()
-            logger.info(f"[VAE Optimize] diffusers decode: {time.perf_counter() - t0:.3f}s")
-        return result
+            logger.info(f"[VAE Optimize] encode: {time.perf_counter() - t0:.3f}s")
+
+        if not return_dict:
+            from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
+            return (DiagonalGaussianDistribution(enc),)
+
+        from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
+        from diffusers.models.modeling_outputs import AutoencoderKLOutput
+        return AutoencoderKLOutput(latent_dist=DiagonalGaussianDistribution(enc))
 
     def forward(self, *args, **kwargs):
         return self.vae(*args, **kwargs)
@@ -763,8 +916,8 @@ Examples:
                         help="Tile size for spatial tiling")
     parser.add_argument("--tile_overlap", type=int, default=32,
                         help="Overlap between tiles")
-    parser.add_argument("--decode_batch", type=int, default=1,
-                        help="Temporal batch size for decode (>1 to batch frames)")
+    parser.add_argument("--decode_batch", type=int, default=4,
+                        help="Temporal batch size for decode (>1 to batch latent frames)")
     parser.add_argument("--channel_last", action="store_true",
                         help="Use channels_last memory format")
 
@@ -772,7 +925,7 @@ Examples:
     parser.add_argument("--frames", type=int, default=81, help="Number of video frames")
     parser.add_argument("--height", type=int, default=480, help="Video height")
     parser.add_argument("--width", type=int, default=832, help="Video width")
-    parser.add_argument("--warmup", type=int, default=2, help="Warmup iterations")
+    parser.add_argument("--warmup", type=int, default=3, help="Warmup iterations (3+ recommended for torch.compile)")
     parser.add_argument("--repeats", type=int, default=5, help="Benchmark iterations")
     parser.add_argument("--compare", action="store_true",
                         help="Run baseline and optimized, then show comparison")
